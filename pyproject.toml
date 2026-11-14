@@ -1,0 +1,16 @@
+[project]
+name = "fire-atlas-data"
+version = "0.1.0"
+description = "Out-of-core NASA FIRMS observation normalization for backend and ML"
+requires-python = ">=3.12,<3.15"
+dependencies = ["duckdb==2.0.0", "pytz>=2025.2", "h3>=4.2,<5", "xgboost>=3,<4", "numpy>=2,<3", "scikit-learn>=1.6,<2", "pyarrow>=19,<24", "deltalake>=1.6,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "jsonschema>=4,<5", "strictdoc==0.30.4", "pact-python>=3,<4", "PyYAML>=6,<7"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
