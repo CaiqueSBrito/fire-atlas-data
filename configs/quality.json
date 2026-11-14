@@ -1,0 +1,17 @@
+{
+  "sources": ["output/viirs-noaa20-real/accepted/**/*.parquet"],
+  "bbox": [-48, -17, -46, -15],
+  "h3_resolution": 5,
+  "region": "central_brazil_bbox",
+  "warmup_start": "2026-09-01",
+  "enhanced_features": true,
+  "minimum_history_days": 14,
+  "splits": {
+    "train": ["2026-09-15", "2026-10-10"],
+    "validation": ["2026-10-11", "2026-10-15"],
+    "test": ["2026-10-16", "2026-10-20"]
+  },
+  "publish_date": "2026-10-21",
+  "memory_limit": "512MB",
+  "threads": 2
+}
