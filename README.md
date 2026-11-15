@@ -37,7 +37,16 @@ python -m fire_atlas_data gold-map --silver demo/lake/silver --target demo/lake/
 ```
 
 - Saída: tabelas Delta em `demo/lake/`, com os focos por hexágono H3 de res0 a res6.
-- O histórico completo (660 M focos), a série harmonizada e a previsão ficam no bucket S3 do projeto. Acessá-los exige credenciais AWS da conta, que não são distribuídas no repositório.
+- O histórico completo (660 M focos), a série harmonizada e a previsão ficam no bucket S3 do projeto. Para avaliadores, existe uma credencial **somente leitura** (`gold/`, `prata/silver/`, `models/`), enviada por canal privado e nunca pelo repositório. Com ela num arquivo `.env`, a série harmonizada é lida assim:
+
+```bash
+set -a; . ./.env; set +a
+python -c "
+import duckdb, os; from deltalake import DeltaTable
+con = duckdb.connect()
+con.register('h', DeltaTable(os.environ['LAKE'] + '/gold/harmonized/cells').to_pyarrow_dataset())
+print(con.execute('SELECT year(day), round(sum(harmonized)) FROM h WHERE resolution = 0 GROUP BY 1 ORDER BY 1').fetchall())"
+```
 - O job diário precisa de uma `FIRMS_MAP_KEY` própria, gratuita, obtida em <https://firms.modaps.eosdis.nasa.gov/api/map_key/>. Use `.env.example` como modelo.
 
 ## Lake no S3
