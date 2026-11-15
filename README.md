@@ -1,12 +1,14 @@
 # Fire Atlas Data
 
-Normalização FIRMS e experimentos retrospectivos de previsão de detecções. O novo alvo aprovado é **alguma detecção em uma célula entre D+1 e D+7**, inclusive; os experimentos XGBoost D+1 anteriores ficam preservados. Requisitos e processo: [harness `.omp/`](.omp/README.md), RF11/CA09 e RF10/CA08. Sem declaração de harmonização científica, probabilidade calibrada de incêndio ou aceite operacional.
+Pipeline de dados do Fire Atlas para detecções NASA FIRMS. O fluxo é: normalização dos CSVs, lake Delta no S3 (bronze/prata/gold), harmonização MODIS/VIIRS para o calendário (RF07/CA07) e previsão XGBoost da probabilidade de alguma detecção por célula H3 res6 em `[D 09:00 UTC, D+7 09:00 UTC)` (RF10/CA08). Um job diário na AWS atualiza a silver, a previsão, a harmonização e a localização das células. Requisitos e processo ficam no [harness `.omp/`](.omp/README.md).
+
+Nenhum resultado aqui tem aceite científico: os limiares de CA07 e CA08 não foram aprovados, as probabilidades são experimentais e ausência de detecção não prova ausência de fogo.
 
 ## Escala
 
-Implementação vetorizada com **DuckDB out-of-core**, banco intermediário em disco e **Parquet particionado por ano/mês**. Não materializa o CSV inteiro em pandas/listas Python nem gera JSON por registro. Memória, threads e spill são configuráveis. Leitores consultam colunas e partições necessárias, sem converter todo o dataset para DataFrame.
+A implementação é vetorizada com **DuckDB out-of-core**. O banco intermediário fica em disco e as saídas são Parquet/Delta particionadas. Nenhum CSV é materializado inteiro em pandas ou listas Python. Memória, threads e spill são configuráveis por comando.
 
-Esse desenho permite processar dados maiores que RAM disponível em uma máquina; capacidade/throughput para bilhões de registros depende de disco, memória, particionamento e infraestrutura e requer benchmark representativo. `memory_limit` controla memória gerenciada pelo DuckDB, não estabelece teto rígido para RSS total. Arquivo raw, staging, banco intermediário, spill e saída precisam caber em armazenamento local. Não há execução distribuída ou retomada de carga parcialmente concluída nesta versão; a publicação é por execução completa. Processar fontes em datasets independentes evita arquivo monolítico e permite consulta via glob de vários datasets.
+`memory_limit` controla a memória gerenciada pelo DuckDB, não o RSS total. Capacidade para bilhões de registros depende de disco, memória e particionamento; os tempos e picos medidos estão em cada doc. A normalização publica por execução completa. Silver, `ml-dataset` e `harmonize` gravam um commit Delta por mês ou ano e podem ser retomados.
 
 ## Instalação
 
@@ -16,7 +18,45 @@ uv sync --locked --python 3.12
 source .venv/bin/activate
 ```
 
-Dependências do produto e verificações ficam no lock da raiz. As ferramentas de StrictDoc/OpenSpec e papéis do harness continuam em `.omp/`; não há CLI de orquestração LangGraph.
+Dependências do produto e das verificações ficam no lock da raiz. StrictDoc, OpenSpec e os papéis do harness ficam em `.omp/`.
+
+## Rodar sem credenciais (avaliadores)
+
+Nada abaixo exige chave da NASA, conta AWS ou arquivo `.env`.
+
+```bash
+uv sync --locked --python 3.12 && source .venv/bin/activate
+python -m pytest -q          # 94 testes: normalização, silver, mapa, harmonização, previsão e job diário em dados sintéticos
+
+# Focos reais das últimas 24 h (NOAA-20, arquivo público do FIRMS), num lake local
+curl -sSfL -o j1.csv https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Global_24h.csv
+export PYTHONPATH=src
+python -m fire_atlas_data normalize j1.csv --output-dir demo/norm --source-product VIIRS_NOAA20_NRT
+python -m fire_atlas_data silver demo/norm --target demo/lake/silver
+python -m fire_atlas_data gold-map --silver demo/lake/silver --target demo/lake/map_grid
+```
+
+- Saída: tabelas Delta em `demo/lake/`, com os focos por hexágono H3 de res0 a res6.
+- O histórico completo (660 M focos), a série harmonizada e a previsão ficam no bucket S3 do projeto. Acessá-los exige credenciais AWS da conta, que não são distribuídas no repositório.
+- O job diário precisa de uma `FIRMS_MAP_KEY` própria, gratuita, obtida em <https://firms.modaps.eosdis.nasa.gov/api/map_key/>. Use `.env.example` como modelo.
+
+## Lake no S3
+
+Bucket `s3://data-lake-fire-atlas-553607359608-us-east-2-an` (us-east-2). O S3 é a fonte de verdade: as cópias locais da silver e da previsão foram apagadas em 14/11/2026.
+
+| Prefixo | Conteúdo | Comando |
+|---|---|---|
+| `bronze/raw/`, `bronze/daily-ingest/` | CSVs FIRMS intactos com `validation.json`; execuções do job diário | carga manual (`raw`); `daily-ingest --archive-uri` |
+| `prata/silver` | Observações normalizadas (contrato 1.3.0) com `h3_r0..h3_r6`, sem filtro de confiança | `normalize` → `silver` |
+| `coverage/granules`, `coverage/cells` | Footprints CMR das passagens e passagens por célula res4 × janela de 24 h | `coverage-granules`, `coverage-cells` |
+| `gold/map_grid` | Detecções diárias por célula res0–6 e sensor, para o mapa | `gold-map` |
+| `gold/h3_places` | Continente, país, cidade e fonte fixa por célula | `gold-places` |
+| `gold/harmonized/` | Série diária harmonizada (escala Aqua) por célula res0–6 | `harmonize` |
+| `gold/ml_dataset` | Célula res6 × dia D: features até o corte e alvo de 7 dias | `ml-dataset` |
+| `gold/forecast` | Probabilidade de detecção em 7 dias por célula res6 e emissão D | `ml-forecast` |
+| `models/xgb-rf10/`, `models/harmonization/` | Modelo XGBoost e modelo de harmonização | `ml-train`, `harmonize-fit` |
+
+Todos os comandos rodam com `PYTHONPATH=src python -m fire_atlas_data <comando> --help`. As decisões, execuções e contagens de cada camada estão no [dossiê do lake](.omp/tasks/lake-camadas-prata-gold.md).
 
 ## Normalizar
 
@@ -28,163 +68,50 @@ PYTHONPATH=src python -m fire_atlas_data normalize \
   --memory-limit 256MB --threads 1
 ```
 
-O comando é do processamento de dados, não um workflow de agentes. `--source-url`, se fornecida, é metadata declarada pelo operador, não prova de download; não incluir URLs com chaves. O arquivo disponível não veio acompanhado de URL exata/data de download, portanto isso não será inventado.
+O contrato atual é 1.3.0 e o método é 1.6.0. Inválidos são registrados, não descartados silenciosamente. FRP negativo e brilho ≤ 0 K viram NULL sem descartar a detecção. `hotspot_type` vem da coluna `type` do arquivo histórico e fica NULL no NRT. Os produtos `_SP` têm rótulo próprio, que registra a proveniência mas não harmoniza os streams. `--source-url` é metadado declarado pelo operador, não prova de download. Detalhes: [normalização](docs/normalization.md), [schema lógico](contracts/normalized-observation.schema.json), [aquisição e recibos](docs/acquisition.md).
 
-Contrato e limites: [docs/normalization.md](docs/normalization.md), [schema lógico](contracts/normalized-observation.schema.json). Entrada original não é alterada. Inválidos são registrados, não descartados silenciosamente. Disponibilidade histórica desconhecida fica ausente, nunca inferida da aquisição ou hora da execução. Confiança por sensor não é probabilidade de fogo; FRP não é área queimada. Não deduplicar observações como eventos de incêndio nesta etapa.
-
-## Consultar para backend/ML
-
-Parquet tem tipos nativos e permite predicate/projection pushdown. Exemplo com DuckDB:
-
-```python
-import duckdb
-
-connection = duckdb.connect()
-connection.execute("SET memory_limit='256MB'")
-# Exemplo de agregado pequeno; não coletar bilhões de registros com fetchall().
-result = connection.execute("""
-    SELECT acquisition_date, sensor, count(*) AS detections, sum(frp_mw) AS observed_frp_mw
-    FROM read_parquet('output/viirs-noaa20/accepted/**/*.parquet', hive_partitioning=true)
-    WHERE acquisition_year = 2026 AND acquisition_month = 9
-    GROUP BY acquisition_date, sensor
-    ORDER BY acquisition_date, sensor
-""").fetchall()
-```
-
-Essa soma é descritiva das observações, não harmonização de sensores nem estimativa de área de fogo. A normalização preserva apenas observações; features, rótulos de ocorrência observada e ranking pertencem à etapa separada abaixo.
-
-## Agregar para o mapa
+## Silver e gold do mapa
 
 ```bash
-PYTHONPATH=src python -m fire_atlas_data map-grid output/firms-backfill/*/*/*/ \
-  --output-dir output/map-h3-daily \
-  --resolutions 2,3,4,5,6,7,8 --group-by platform --memory-limit 4GB --threads 4
+LAKE=s3://data-lake-fire-atlas-553607359608-us-east-2-an
+PYTHONPATH=src python -m fire_atlas_data silver output/firms-backfill/*/*/*/ --target $LAKE/prata/silver --optimize
+PYTHONPATH=src python -m fire_atlas_data gold-map --silver $LAKE/prata/silver --target $LAKE/gold/map_grid --optimize
 ```
 
-Renderizar uma feição por detecção é inviável nessa escala: no acervo local de 660.284.137 registros, a célula de 1° mais densa acumula 942.406 detecções. `map-grid` conta detecções por célula **H3, dia UTC e sensor/plataforma** em várias resoluções, uma por faixa de zoom (decisão do usuário: res2–8, diário). Qualquer intervalo de datas é somado na consulta. ML usa somente H3 res5, com grade própria; as resoluções do mapa não definem features nem rótulos. MODIS e VIIRS ficam em linhas separadas, sem harmonização nem deduplicação entre plataformas; célula ausente é desconhecida, não ausência de fogo. Detalhes e saída: [docs/normalization.md](docs/normalization.md#agregação-para-mapa).
+A silver guarda todas as observações aceitas com uma célula H3 por resolução de 0 a 6, particionadas por ano e mês de aquisição. Os níveis são aninhados exatamente. `gold-map` agrega por (resolução, célula, dia UTC, sensor) e não soma sensores. Detalhes do mapa: [normalização § agregação para mapa](docs/normalization.md#agregação-para-mapa). Para localização das células: [gold-places](docs/gold-places.md).
 
-## Experimento XGBoost com os dados locais
+## Harmonização para o calendário (RF07)
 
-Configuração reproduzível: [`configs/prototype.json`](configs/prototype.json). Recorte fixo `[-48,-17,-46,-15]`, H3 resolução 5, 161 células candidatas sem máscara terrestre certificada. Ausência de detecção é desconhecida, não ausência confirmada de fogo.
+`harmonize-fit`, `harmonize-eval`, `harmonize-eras` e `harmonize` põem Terra, Aqua, Suomi-NPP, NOAA-20 e NOAA-21 na escala do Aqua. O resultado é uma série diária por célula de 2000 até hoje. Em produção está o modelo `models/harmonization/v0.3.0`: um modelo de detecção XGBoost para os VIIRS, a curva para o Terra e fatores regionais com encolhimento (κ = 30).
 
-```bash
-PYTHONPATH=src python -m fire_atlas_data.features \
-  --config configs/prototype.json --output-dir output/rf10-prototype/features
-PYTHONPATH=src python -m fire_atlas_data.ranking train \
-  --features output/rf10-prototype/features/features.parquet \
-  --output-dir output/rf10-prototype/model-heldout --k 10
-PYTHONPATH=src python -m fire_atlas_data.ranking publish \
-  --features output/rf10-prototype/features/features.parquet \
-  --model-dir output/rf10-prototype/model-heldout --output-dir output/rf10-prototype/publication-heldout
-```
+Erro contra o Aqua real, por região res2 × mês, em anos fora do ajuste:
+- VIIRS: ~10%;
+- Terra: ~23%;
+- soma dos satélites sem harmonizar: ~800%;
+- piso entre dois VIIRS: ~7%.
 
-Saídas existentes não são sobrescritas: escolher novos diretórios para repetir. A transformação usa informações adquiridas até D e observa D+1 somente como alvo; a partição de publicação não exige conhecer D+1. Como `available_at` histórico é desconhecido, isso é **backtest por aquisição**, não disponibilidade operacional comprovada.
+O método é uma proposta com teste retrospectivo, sem limiar de aceite aprovado. Ver [harmonização](docs/harmonization.md) e o [dossiê RF07](.omp/tasks/RF07-harmonizacao-hackathon.md). Para a apresentação: [roteiro do pitch](docs/pitch.md) e [indicadores e alertas do app (proposta)](docs/app-indicators.md).
 
-Treino: emissões 01–10/10/2026; validação: 11–15/10; teste reservado: 16–20/10, alvos 17–21/10. O dia 22/10 está parcial na fonte e foi excluído dos alvos de avaliação. Somente a validação seleciona o modelo; o teste não escolhe hiperparâmetros. Controles são amostrados apenas no treino; avaliação considera todos os candidatos elegíveis. Publicação local: emissão nominal retrospectiva 21/10, alvo 22/10 sem rótulo.
+## Previsão de 7 dias (RF10)
 
-Execução real: modelo completo selecionado na validação; capturou 10 de 36 novos registros célula-dia no teste (27,8%), com dez destaques por dia e 10/50 destaques com registro observado (20%). Apenas cinco dias e um recorte: não comprova generalização. Sem anos anteriores, a referência sazonal é constante e **não suportada**; não alegar superioridade sobre uma referência sazonal válida.
+1. `coverage-granules` e `coverage-cells` registram as passagens dos satélites. Um alvo 0 exige passagem registrada em todas as 7 janelas; sem passagem, o alvo é desconhecido e fica fora do treino.
+2. `ml-dataset` monta `gold/ml_dataset`. O universo são as células res6 com alguma detecção não offshore antes de D. As features (`det_24h`, `det_3d`, `det_7d`, `frp_mean_7d`, brilho MODIS/VIIRS de 7 dias e vizinhança em anéis 1–2) usam só detecções anteriores a D 09:00 UTC.
+3. `ml-train` faz uma busca aleatória de 20 configs XGBoost com treino 2012-02-01..2020-12-17, validação 2021-01-01..2022-12-17, embargo de 14 dias e teste único a partir de 2023-01-01.
+4. `ml-forecast` grava em `gold/forecast` as probabilidades de uma emissão D e recusa silver defasada. Ver [previsão](docs/ml-forecast.md).
 
-Artefatos: `output/rf10-prototype/model-heldout/comparison.json`, modelos JSON e `backtest_predictions.parquet` com os 731 candidatos de teste, score, posição e resultado observado por célula-dia. Publicação: ranking Parquet e [mapa HTML local](output/rf10-prototype/publication-heldout/map.html), sem backend/app integrado. Protocolo, hashes, evidências e limitações no [dossiê RF10](.omp/tasks/RF10-ranking-prototipo.md).
+Resultado retrospectivo do modelo atual no teste 2023-01-01..2026-11-06 (873.756.119 linhas, taxa base 0,062): AP 0,568, contra 0,496 da persistência e 0,363 da climatologia. Brier 0,0375. É uma medida reportada, não aprovada. O modelo não prevê células sem histórico. O experimento `ml-coldstart`/`ml-coldstart-eval` com células frias teve AP 0,083 e só alcança cerca de 28% das primeiras detecções. Ver o [dossiê de covariáveis](.omp/tasks/RF10-covariaveis-pontos-novos.md).
 
-Detalhes: [aquisição e recibos](docs/acquisition.md), [célula-dia e features](docs/features.md), [treino, teste e publicação](docs/ranking.md). Aquisição histórica exige URL autorizada; Area API exige chave em ambiente. Nenhum histórico autenticado foi baixado nesta execução. Recibo de importação local não recupera disponibilidade histórica. A normalização aceita os streams NRT e SP (padrão/científico); os produtos `_SP` passaram a ter rótulo próprio no contrato 1.2.0, mas isso é rotulagem de proveniência, não harmonização científica entre streams. O contrato atual é 1.3.0 (método 1.5.0): acrescenta `hotspot_type` a partir da coluna `type` do FIRMS e, desde o método 1.5.0, anula FRP negativo e brilho ≤ 0 K sem descartar a detecção; datasets 1.2.0 precisam ser renormalizados para o pipeline global.
+## Job diário e AWS
 
-## Melhoria de qualidade: experimento e limite observado
+`daily-ingest` busca o FIRMS Area API (NRT mundial), normaliza e faz append sem duplicar na silver. Em seguida grava a previsão de D e, opcionalmente, reconstrói `gold/h3_places` e regrava os anos recentes de `gold/harmonized`. Ver [job diário](docs/daily-ingest.md).
 
-O experimento [`configs/quality.json`](configs/quality.json) amplia o treino para 15/09–10/10 e acrescenta recorrência própria, duas faixas de vizinhança, FRP histórico e coordenadas do centro da célula. Treino: 3.625 candidatos/155 positivos, contra 1.433/52 antes. As janelas iniciais de 30 dias são censuradas, com suporte de calendário explícito.
+- Local: `Dockerfile` e `compose.yaml`; copiar `.env.example` para `.env`. Não rodar junto com o job da AWS, pois não há lock entre hosts.
+- AWS: `deploy/aws/daily-ingest.yaml` (ECS Fargate, agendado às 10:00 e 14:00 UTC) e `deploy/aws/deploy.sh`. A chave FIRMS fica no SSM `/fire-atlas/firms-map-key`. `deploy/aws/experiment-vm.yaml` é a VM do experimento cold-start.
+- O backend consome só `s3://…/gold/forecast` e as tabelas gold; o modelo não é entregue a ele.
 
-```bash
-PYTHONPATH=src python -m fire_atlas_data.features \
-  --config configs/quality.json --output-dir output/rf10-quality/features
-PYTHONPATH=src python -m fire_atlas_data.quality train \
-  --features output/rf10-quality/features/features.parquet \
-  --baseline-model-dir output/rf10-prototype/model-heldout \
-  --output-dir output/rf10-quality/model --k 10
-```
+## Experimentos res5 removidos
 
-Busca predefinida de 11 candidatos mais o campeão original congelado, selecionada apenas na validação. O vencedor passou de 1/12 para 4/12 capturados na validação, mas **regrediu de 10/36 para 4/36 no teste diagnóstico de outubro**. Não houve aumento comprovado de qualidade e essa versão **não substitui o modelo anterior**; sua publicação é bloqueada.
-
-Foi também baixado e normalizado um CSV público oficial NOAA-20 de sete dias: 65.247 observações reais, sem MAP_KEY. Avaliação congelada em emissões 08–10/11, alvos09–11/11: 461 candidatos e zero positivos observados, portanto recall indefinido e evidência insuficiente para medir ganho. Existe lacuna de entrada 23/10–04/11; não apresentar esse lote como histórico contínuo ou comprovação operacional.
-
-Dados/artefatos: `output/rf10-quality/`; resultados em `model/comparison.json` e `independent-evaluation/comparison.json`. [Protocolo, fontes e evidências](.omp/tasks/RF10-qualidade-preditiva.md), [comandos e contrato](docs/quality.md). A avaliação nova não retreina, não seleciona e não desbloqueia automaticamente promoção. Diretórios existentes não são sobrescritos.
-
-## Experimento D+1 preservado
-
-`configs/activity.json` mantém região/H3 e inclui todas as161células por dia,
-sem excluir atividade recente. Rótulos continuam específicos a NOAA-20 NRT;
-zero não comprova ausência de fogo. Build real:259positivos no treino,
-24na validação e44no TEST diagnóstico já conhecido. Perfil XGBoost fixo treinado
-com dados locais:8/24capturas na validação e9/44no diagnóstico,sem meteorologia
-ou vegetação e sem promoção. Não comparar com modelos antigos de novidade.
-Contrato/comando em [features](docs/features.md); autorização e evidências no
-[dossiê de atividade](.omp/tasks/RF10-atividade-d1.md).
-
-## Grade diária enriquecida e histórico plurianual
-
-Implementados cruzamentos reais com ERA5 histórico até D, previsão GFS por
-rodada e NDVI/EVI com qualidade e idade. A grade mantém 161 células H3 por dia
-(aproximadamente 280–288 km² cada, não 1 km²), rótulos 1/0 de detecção observada
-e lags de focos. Dataset enriquecido: `output/rf10-environment/features/`.
-
-O experimento pareado não melhorou: baseline 9/44 capturas no diagnóstico,
-contra 5/44 com todas as novas entradas. Baseline mantido pela validação,
-sem promoção. Modelos e inferência definitivos: `model-contract/` e
-`inference-contract/` sob `output/rf10-environment/`. Suíte: 209 testes passaram.
-
-Histórico público NOAA-20 SP 2018–2025 adquirido sem credenciais e materializado
-separadamente em 455.791 células-dia, com 15.279 positivos e lags de sete dias.
-Não foi misturado silenciosamente ao alvo NRT nem usado no treino curto de 2026.
-Comandos, fontes, resultado e limites: [grade ambiental](docs/environmental.md),
-[histórico](docs/history.md) e [dossiê](.omp/tasks/RF10-entradas-ambientais.md).
-
-## Objetivo atual: alguma detecção nos próximos sete dias
-
-Para emissão no fim de D, rótulo 1 se houver detecção NOAA-20 SP na célula
-entre D+1 e D+7, inclusive; 0 se não houver detecção fornecida nessa janela.
-Continuidade e novas ocorrências contam. Features usam somente D e o passado.
-Não prever ignição exata nem tratar zero como ausência física confirmada.
-
-Grade real preparada em `output/rf10-weekly/grid/`: **454.825 células-dia,
-68.706 janelas positivas e 386.119 zeros**, nas mesmas 161 células H3.
-Emissões 01/04/2018–24/12/2025; somente janelas futuras completas.
-O primeiro modelo semanal e a busca de melhoria v2 foram treinados com folds
-temporais expurgados. A v2 usa 32 preditores e selecionou XGBoost `rank:ndcg`.
-No **diagnóstico reutilizado de 2025**, precisão@10 passou de **34,92% para
-44,05%**, com recall macro de 17,03% para 24,79%; em 2024, precisão passou
-de 33,06% para 40,22%. Não são resultados de teste independente.
-
-A meta de 80% não foi atingida. Com dez destaques obrigatórios todos os dias,
-o teto matemático no agregado 2024–2025 é 77,87%, mesmo com um oráculo.
-Artefatos completos: `output/rf10-weekly/model-v2-run2/`; modelo anterior
-preservado, sem promoção operacional. [Método predeclarado](docs/weekly-improvement.md),
-[comandos e resultados](docs/quality.md#melhoria-semanal-v2-precisão-sem-alterar-o-orçamento)
-e [evidências da melhoria](.omp/tasks/RF10-melhoria-7dias.md).
-
-Contrato/comando em [histórico](docs/history.md) e autorização/evidências no
-[dossiê de sete dias](.omp/tasks/RF10-atividade-7dias.md). Verificação consolidada:
-216 testes passaram; rótulos futuros reconciliados com os dados D+1 preservados,
-sem alteração dos lags.
-
-
-
-
-## Pipeline global semanal por recorte
-
-O novo caminho usa H3 res5 e alvo multissensor de detecção não estática em
-D+1…D+7. Não substitui nem reinterpreta os experimentos históricos acima.
-O recorte escolhe células com histórico conhecido até a emissão; não muda
-as features da mesma célula. Ausência de previsão fora do domínio não é zero.
-
-- [Protocolo proposto e limites científicos](docs/global-weekly-protocol.md).
-- [Máscara fina e atividade multissensor](docs/global-activity.md).
-- [Features causais, amostragem e contratos](docs/global-features.md).
-- [Inferência por bbox e artefatos](docs/global-forecast.md).
-- Configuração de treino: `configs/global-weekly.json`; módulo
-  `PYTHONPATH=src python -m fire_atlas_data.global_training --help`.
-
-Normalização 1.3.0 preserva `hotspot_type` anulável. Máscara e parâmetros
-científicos são explícitos; inferência não instala extensões nem baixa fontes.
-Backfill completo e treinamento real continuam não autorizados. Testes e
-modelos sintéticos verificam engenharia, não precisão mundial nem aceite CA08.
+Os experimentos com H3 res5 (protótipo D+1 no recorte `[-48,-17,-46,-15]`, grade ambiental ERA5/GFS/NDVI, histórico NOAA-20 SP e pipeline global semanal) e o comando `map-grid` foram removidos em 14/11/2026, por decisão do usuário. O código está no commit `cb3e35c`. Protocolos, resultados e limites continuam nos dossiês `.omp/tasks/RF10-*.md` e nas evidências `.omp/evidence/`. As saídas locais desses experimentos já tinham sido apagadas.
 
 ## Verificação
 
@@ -195,4 +122,4 @@ python .omp/scripts/validate_specs.py
 (cd .omp && npm exec --yes --package=node@22.22.2 -- npm run spec:validate)
 ```
 
-Pact não é executado para inventar uma integração: ainda não existe API real do backend consumidor. Nesta etapa, o contrato exercitado é o schema do dataset Parquet e suas invariantes. Dados brutos/gerados ficam fora do Git; somente código, contratos e evidências pequenas devem ser versionados.
+Pact não é executado porque não existe API real de backend consumidor. Os contratos exercitados são o schema Parquet normalizado e as invariantes conferidas por `verify` em cada tabela Delta. Dados brutos e gerados ficam fora do Git.

@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  fire-atlas-data daily-ingest on ECS Fargate (RF11, RF10/CA08). EventBridge Scheduler starts one task per
+  scheduled time; the task fetches FIRMS NRT (world), appends new observations to the S3 silver Delta table,
+  writes the 7-day forecast to S3 gold/forecast, rebuilds the S3 gold/h3_places lookup, refreshes the recent years of S3 gold/harmonized and archives the run
+  directory to S3 bronze/daily-ingest.
+  Reruns are idempotent. The FIRMS MAP_KEY comes from an SSM SecureString created outside this stack.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  LakeBucket:
+    Type: String
+    Default: data-lake-fire-atlas-553607359608-us-east-2-an
+  ImageTag:
+    Type: String
+    Description: Immutable tag of the image pushed to this stack's ECR repository.
+  FirmsKeyParameterName:
+    Type: String
+    Default: /fire-atlas/firms-map-key
+    Description: SSM SecureString (default aws/ssm key) holding the FIRMS MAP_KEY; name without leading ARN.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets with a route to the internet (FIRMS API, ECR, S3); tasks get a public IP.
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 10,14 * * ? *)
+    Description: UTC. The 14:00 run retries the day idempotently if the 10:00 run failed or FIRMS was late.
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Image source for the task; tags are immutable so a task definition always runs the reviewed build.
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"keep the 10 newest images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
+          "action":{"type":"expire"}}]}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: 90
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Outbound-only (FIRMS HTTPS, ECR, S3, SSM, CloudWatch Logs); the task serves nothing.
+        must: No ingress rules.
+    Properties:
+      GroupDescription: daily-ingest task, egress only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to FIRMS and AWS APIs
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Used by Fargate to pull the image, write logs and inject the FIRMS key secret.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: pull-log-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt Repository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${LogGroup.Arn}:*"
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FirmsKeyParameterName}"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Application access to the lake; read model and reference files, read/append silver, write forecast,
+          place lookup, harmonized activity and run archive.
+        must: Bucket uses SSE-S3 (no KMS permissions). Object reads/writes only under these prefixes; listing is bucket-wide.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: lake
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListLake
+                # pyarrow checks the bucket with HeadBucket (s3:ListBucket without a prefix) before writing the
+                # run archive, so a prefix condition here fails the task. Grants key listing, not object reads.
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}"
+              - Sid: ReadModelAndTables
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/models/xgb-rf10/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/models/harmonization/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/reference/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/prata/silver/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/forecast/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/h3_places/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/harmonized/*"
+              - Sid: WriteDeltaTables
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/prata/silver/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/forecast/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/h3_places/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/harmonized/*"
+              - Sid: WriteRunArchive
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/bronze/daily-ingest/*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          One-shot run; the job is idempotent, so the scheduler can start it twice a day. 16 GB covers the
+          universe scan over the full silver (about 3.3 GB peak locally) plus Arrow buffers.
+    Properties:
+      Family: !Ref AWS::StackName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "4096"
+      Memory: "16384"
+      EphemeralStorage:
+        SizeInGiB: 30
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: daily-ingest
+          Image: !Sub "${Repository.RepositoryUri}:${ImageTag}"
+          Essential: true
+          Command:
+            - daily-ingest
+            - !Sub "--silver=s3://${LakeBucket}/prata/silver"
+            - !Sub "--model=s3://${LakeBucket}/models/xgb-rf10/model.ubj"
+            - !Sub "--report=s3://${LakeBucket}/models/xgb-rf10/report.json"
+            - !Sub "--forecast-target=s3://${LakeBucket}/gold/forecast"
+            - !Sub "--places-target=s3://${LakeBucket}/gold/h3_places"
+            - !Sub "--places-countries=s3://${LakeBucket}/reference/ne_10m_admin_0_countries.zip"
+            - !Sub "--places-cities=s3://${LakeBucket}/reference/cities1000.zip"
+            - !Sub "--harmonize-model=s3://${LakeBucket}/models/harmonization/v0.3.0"
+            - !Sub "--harmonize-target=s3://${LakeBucket}/gold/harmonized/cells"
+            - !Sub "--harmonize-availability=s3://${LakeBucket}/gold/harmonized/availability"
+            - !Sub "--archive-uri=s3://${LakeBucket}/bronze/daily-ingest"
+            - --work-dir=/tmp/daily
+            - --optimize
+            - --memory-limit=8GB
+            - --threads=4
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          Secrets:
+            - Name: FIRMS_MAP_KEY
+              ValueFrom: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FirmsKeyParameterName}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: run
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: EventBridge Scheduler starts the task; may pass only this stack's task and execution roles.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default" }
+      Policies:
+        - PolicyName: run-task
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}:*"
+                Condition:
+                  ArnEquals: { ecs:cluster: !GetAtt Cluster.Arn }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt ExecutionRole.Arn, !GetAtt TaskRole.Arn]
+                Condition:
+                  StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com }
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: daily-ingest FIRMS -> silver -> forecast
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      State: !Ref ScheduleState
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          LaunchType: FARGATE
+          PlatformVersion: LATEST
+          TaskCount: 1
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: ENABLED
+              Subnets: !Ref SubnetIds
+              SecurityGroups: [!Ref TaskSecurityGroup]
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  TaskSecurityGroupId:
+    Value: !Ref TaskSecurityGroup
+  LogGroupName:
+    Value: !Ref LogGroup

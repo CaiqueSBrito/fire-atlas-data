@@ -238,12 +238,23 @@ def _evaluate(connection: duckdb.DuckDBPyConnection, booster: xgb.Booster, month
     return {"rows": rows, "metrics": {name: _summarize(acc) for name, acc in accumulators.items()}}
 
 
+def _search_key(dataset: str, splits: dict, seed: int, max_rounds: int, early_stopping: int,
+                 row_sample_rate: float, device: str) -> dict:
+    """Settings that must match for configs of an earlier run in the same output dir to be reused."""
+    return {"method_version": METHOD_VERSION, "dataset": dataset, "dataset_version": DeltaTable(dataset).version(),
+            "splits": splits, "seed": seed, "max_rounds": max_rounds, "early_stopping": early_stopping,
+            "row_sample_rate": row_sample_rate, "sample_seed": SAMPLE_SEED, "device": device}
+
+
 def train(dataset: str, output_dir: str | Path, *, train_start: date = date(2012, 2, 1),
           valid_start: date = date(2021, 1, 1), test_start: date = date(2023, 1, 1),
           test_end: date | None = None, embargo_days: int = 14, configs: int = 20, seed: int = 20261114,
           max_rounds: int = 3000, early_stopping: int = 100, row_sample_rate: float = 0.2,
           device: str = "cuda", memory_limit: str = "8GB", threads: int = 8) -> dict:
-    """Random search on train/valid, keep the best valid PR-AUC model, then score test once."""
+    """Random search on train/valid, keep the best valid PR-AUC model, then score test once.
+
+    Resumable: configs already in `<output_dir>/search.json` with their model file are reused when
+    `search-key.json` matches the current settings; a mismatch refuses to mix runs."""
     if embargo_days < TARGET_DAYS:
         raise ValueError(f"embargo_days must be >= {TARGET_DAYS} (target window length)")
     train_end = valid_start - timedelta(days=embargo_days + 1)
@@ -260,6 +271,17 @@ def train(dataset: str, output_dir: str | Path, *, train_start: date = date(2012
     split_months = {"train": _table_months(dataset, train_start, train_end),
                     "valid": _table_months(dataset, valid_start, valid_end),
                     "test": _table_months(dataset, test_start, test_end)}
+    splits = {"train": [train_start.isoformat(), train_end.isoformat()],
+              "valid": [valid_start.isoformat(), valid_end.isoformat()],
+              "test": [test_start.isoformat(), test_end.isoformat()], "embargo_days": embargo_days}
+    key = _search_key(dataset, splits, seed, max_rounds, early_stopping, row_sample_rate, device)
+    key_path, search_path = output / "search-key.json", output / "search.json"
+    previous = {}
+    if search_path.exists():
+        if not key_path.exists() or json.loads(key_path.read_text()) != key:
+            raise ValueError(f"{search_path} belongs to other settings (see {key_path}); use a new output dir")
+        previous = {r["name"]: r for r in json.loads(search_path.read_text())}
+    key_path.write_text(json.dumps(key, indent=1))
     started = time.monotonic()
     dtrain = xgb.QuantileDMatrix(_MonthBatches(connection, split_months["train"], train_start, train_end,
                                                row_sample_rate), max_bin=MAX_BIN)
@@ -271,20 +293,27 @@ def train(dataset: str, output_dir: str | Path, *, train_start: date = date(2012
             "eval_metric": ["logloss", "aucpr"], "seed": seed}  # early stopping uses the last metric
     search, best = [], None
     for index, config in enumerate(_search_configs(configs, seed)):
-        history: dict = {}
-        tic = time.monotonic()
-        booster = xgb.train({**base, **config}, dtrain, num_boost_round=max_rounds, evals=[(dvalid, "valid")],
-                            early_stopping_rounds=early_stopping, evals_result=history, verbose_eval=False)
-        booster = booster[: booster.best_iteration + 1]
         name = f"config-{index:02d}"
-        booster.save_model(output / "models" / f"{name}.ubj")
-        result = {"name": name, "params": config, "best_iteration": booster.num_boosted_rounds() - 1,
-                  "valid_aucpr": history["valid"]["aucpr"][booster.num_boosted_rounds() - 1],
-                  "valid_logloss": history["valid"]["logloss"][booster.num_boosted_rounds() - 1],
-                  "seconds": round(time.monotonic() - tic, 1)}
+        model_path = output / "models" / f"{name}.ubj"
+        prior = previous.get(name)
+        if prior is not None and prior["params"] == config and model_path.exists():
+            booster, result = xgb.Booster(model_file=str(model_path)), prior
+            print(f"ml-train {name}: reused from the earlier run", file=sys.stderr, flush=True)
+        else:
+            history: dict = {}
+            tic = time.monotonic()
+            booster = xgb.train({**base, **config}, dtrain, num_boost_round=max_rounds,
+                                evals=[(dvalid, "valid")], early_stopping_rounds=early_stopping,
+                                evals_result=history, verbose_eval=False)
+            booster = booster[: booster.best_iteration + 1]
+            booster.save_model(model_path)
+            result = {"name": name, "params": config, "best_iteration": booster.num_boosted_rounds() - 1,
+                      "valid_aucpr": history["valid"]["aucpr"][booster.num_boosted_rounds() - 1],
+                      "valid_logloss": history["valid"]["logloss"][booster.num_boosted_rounds() - 1],
+                      "seconds": round(time.monotonic() - tic, 1)}
+            print(f"ml-train {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
         search.append(result)
-        print(f"ml-train {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
-        (output / "search.json").write_text(json.dumps(search, indent=1))
+        search_path.write_text(json.dumps(search, indent=1))
         if best is None or result["valid_aucpr"] > best[0]["valid_aucpr"]:
             best = (result, booster)
     del dtrain, dvalid
@@ -294,13 +323,11 @@ def train(dataset: str, output_dir: str | Path, *, train_start: date = date(2012
     test = _evaluate(connection, booster, split_months["test"], test_start, test_end)
     report = {"method_version": METHOD_VERSION, "dataset": dataset,
               "dataset_version": DeltaTable(dataset).version(), "dataset_method_version": DATASET_METHOD_VERSION,
-              "features": FEATURES, "splits": {
-                  "train": [train_start.isoformat(), train_end.isoformat()],
-                  "valid": [valid_start.isoformat(), valid_end.isoformat()],
-                  "test": [test_start.isoformat(), test_end.isoformat()], "embargo_days": embargo_days},
+              "features": FEATURES, "splits": splits,
               "base_params": base, "max_rounds": max_rounds, "early_stopping_rounds": early_stopping,
               "seed": seed, "row_sample_rate": row_sample_rate, "sample_seed": SAMPLE_SEED,
-              "search": search, "chosen": chosen, "test": test,
+              "search": search, "reused_configs": sorted(set(previous) & {r["name"] for r in search}),
+              "chosen": chosen, "test": test,
               "seconds": round(time.monotonic() - started, 1), "limitations": LIMITATIONS,
               "counts": {"configs": len(search), "test_rows": test["rows"],
                          "chosen": chosen["name"], "valid_aucpr": chosen["valid_aucpr"],

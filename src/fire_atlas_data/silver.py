@@ -4,18 +4,19 @@ Every accepted observation is kept (no confidence filter). Each row carries one
 H3 cell id per resolution 0..6; coarser cells are H3 parents of the res6 cell,
 so all levels nest exactly. Months are written one at a time with a partition
 predicate, so reprocessing a month replaces only that month in one Delta commit.
+`append` adds only rows acquired since a given instant that silver does not already hold (same product,
+acquisition time and coordinates), so overlapping, repeated or resumed incremental runs never duplicate rows.
 Rows inside a month are sorted by `h3_r6`; `optimize` then Z-orders on `h3_r6`.
 """
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
 
 import duckdb
 from deltalake import CommitProperties, DeltaTable, write_deltalake
-
-from .map_grid import load_h3
 
 METHOD_VERSION = "1.0.0"
 RESOLUTIONS = tuple(range(7))
@@ -39,6 +40,12 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def load_h3(connection: duckdb.DuckDBPyConnection) -> None:
+    """Load the DuckDB community H3 extension, installing it on first use."""
+    connection.execute("INSTALL h3 FROM community")
+    connection.execute("LOAD h3")
+
+
 def _sources(datasets: list[str | Path]) -> tuple[list[dict], str]:
     roots = [Path(d).resolve(strict=True) for d in datasets]
     if not roots:
@@ -52,6 +59,38 @@ def _sources(datasets: list[str | Path]) -> tuple[list[dict], str]:
                         "source_product": manifest["source"]["product"]})
     globs = "[" + ",".join(_literal(str(r / "accepted" / "**" / "*.parquet")) for r in roots) + "]"
     return sources, f"read_parquet({globs}, hive_partitioning=true, union_by_name=true)"
+
+
+def _connect(memory_limit: str, threads: int, temp_dir: str | Path | None) -> duckdb.DuckDBPyConnection:
+    if threads < 1:
+        raise ValueError("threads must be positive")
+    connection = duckdb.connect()
+    connection.execute(f"SET memory_limit={_literal(memory_limit)}")
+    connection.execute(f"SET threads={threads}")
+    connection.execute("SET TimeZone='UTC'")
+    if temp_dir is not None:
+        connection.execute(f"SET temp_directory={_literal(str(temp_dir))}")
+    load_h3(connection)
+    return connection
+
+
+def _existing_sql(since: datetime) -> str:
+    """Table `existing_silver`: identity columns of observations acquired at or after `since` in `silver_dataset`."""
+    if since.tzinfo is None:
+        raise ValueError("since must be timezone-aware")
+    return f"""CREATE TABLE existing_silver AS
+        SELECT source_product, acquired_at, latitude, longitude FROM silver_dataset
+        WHERE (acquisition_year > {since.year} OR (acquisition_year = {since.year} AND acquisition_month >= {since.month}))
+          AND acquired_at >= TIMESTAMPTZ {_literal(since.isoformat())}"""
+
+
+def _absent_sql(relation: str, since: datetime) -> str:
+    """Rows of `relation` acquired at or after `since` with no identical observation in `existing_silver`."""
+    return f"""(SELECT n.* FROM {relation} n
+        WHERE n.acquired_at >= TIMESTAMPTZ {_literal(since.isoformat())} AND NOT EXISTS (
+            SELECT 1 FROM existing_silver e
+            WHERE e.source_product = n.source_product AND e.acquired_at = n.acquired_at
+              AND e.latitude = n.latitude AND e.longitude = n.longitude))"""
 
 
 def _month_sql(relation: str, year: int, month: int) -> str:
@@ -71,17 +110,9 @@ def build(datasets: list[str | Path], target: str, *, months: list[tuple[int, in
           storage_options: dict[str, str] | None = None, memory_limit: str = "2GB", threads: int = 2,
           temp_dir: str | Path | None = None) -> dict:
     """Write (or replace) silver months in the Delta table at `target`; return per-month counts."""
-    if threads < 1:
-        raise ValueError("threads must be positive")
     sources, relation = _sources(datasets)
     counts = {}
-    with duckdb.connect() as connection:
-        connection.execute(f"SET memory_limit={_literal(memory_limit)}")
-        connection.execute(f"SET threads={threads}")
-        connection.execute("SET TimeZone='UTC'")
-        if temp_dir is not None:
-            connection.execute(f"SET temp_directory={_literal(str(temp_dir))}")
-        load_h3(connection)
+    with _connect(memory_limit, threads, temp_dir) as connection:
         available = [tuple(row) for row in connection.execute(
             f"SELECT DISTINCT acquisition_year, acquisition_month FROM {relation} ORDER BY 1, 2").fetchall()]
         selected = available if months is None else sorted(set(months))
@@ -106,6 +137,37 @@ def build(datasets: list[str | Path], target: str, *, months: list[tuple[int, in
             counts[f"{year}-{month:02d}"] = expected
     return {"method_version": METHOD_VERSION, "target": target, "h3_resolutions": list(RESOLUTIONS),
             "sources": sources, "counts": counts, "limitations": LIMITATIONS}
+
+
+def append(datasets: list[str | Path], target: str, *, since: datetime,
+           storage_options: dict[str, str] | None = None, memory_limit: str = "2GB", threads: int = 2,
+           temp_dir: str | Path | None = None) -> dict:
+    """Append rows acquired at or after `since` that silver lacks; one commit per month, oldest first.
+
+    Identity is (source_product, acquired_at, latitude, longitude), so NRT records that arrive late for
+    already-ingested times are still added, and a rerun over the same downloads appends nothing."""
+    if not DeltaTable.is_deltatable(target, storage_options=storage_options):
+        raise ValueError("append requires an existing silver Delta table")
+    sources, relation = _sources(datasets)
+    relation = _absent_sql(relation, since)
+    counts = {}
+    with _connect(memory_limit, threads, temp_dir) as connection:
+        connection.register("silver_dataset", DeltaTable(target, storage_options=storage_options).to_pyarrow_dataset())
+        connection.execute(_existing_sql(since))
+        months = connection.execute(f"SELECT acquisition_year, acquisition_month, count(*) FROM {relation} "
+                                    "GROUP BY 1, 2 ORDER BY 1, 2").fetchall()
+        for year, month, expected in months:
+            cursor = connection.cursor()
+            reader = cursor.sql(_month_sql(relation, year, month)).to_arrow_reader(1_000_000)
+            metadata = {"method_version": METHOD_VERSION, "h3_resolutions": json.dumps(list(RESOLUTIONS)),
+                        "sources": json.dumps(sources), "partition": f"{year}-{month:02d}",
+                        "expected_rows": str(expected), "mode": "append", "since": since.isoformat()}
+            write_deltalake(target, reader, mode="append", partition_by=PARTITIONS, schema_mode="merge",
+                            storage_options=storage_options, commit_properties=CommitProperties(custom_metadata=metadata))
+            cursor.close()
+            counts[f"{year}-{month:02d}"] = expected
+    return {"method_version": METHOD_VERSION, "target": target, "sources": sources, "counts": counts,
+            "limitations": LIMITATIONS}
 
 
 def verify(target: str, *, storage_options: dict[str, str] | None = None, memory_limit: str = "2GB") -> dict:

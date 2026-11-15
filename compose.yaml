@@ -1,0 +1,24 @@
+services:
+  daily-ingest:
+    build: .
+    image: fire-atlas-data:latest
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      FIRMS_MAP_KEY: ${FIRMS_MAP_KEY:?set FIRMS_MAP_KEY in the shell or in .env}
+      LAKE: ${LAKE:-s3://data-lake-fire-atlas-553607359608-us-east-2-an}
+      AWS_REGION: ${AWS_REGION:-us-east-2}
+      # Standard AWS credential chain; leave empty on hosts with an instance/task role.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    volumes:
+      - ./data:/app/data  # raw CSVs, receipts, normalized Parquet and report.json per run
+    mem_limit: 8g
+    entrypoint: ["sh", "-c", "exec python -m fire_atlas_data daily-ingest --silver=$$LAKE/prata/silver --model=$$LAKE/models/xgb-rf10/model.ubj --report=$$LAKE/models/xgb-rf10/report.json --forecast-target=$$LAKE/gold/forecast --places-target=$$LAKE/gold/h3_places --places-countries=$$LAKE/reference/ne_10m_admin_0_countries.zip --places-cities=$$LAKE/reference/cities1000.zip --harmonize-model=$$LAKE/models/harmonization/v0.3.0 --harmonize-target=$$LAKE/gold/harmonized/cells --harmonize-availability=$$LAKE/gold/harmonized/availability \"$$@\"", "daily-ingest"]
+    command:
+      - --work-dir=data/daily
+      - --daily-at=10:00
+      - --optimize
+      - --memory-limit=6GB
+      - --threads=4

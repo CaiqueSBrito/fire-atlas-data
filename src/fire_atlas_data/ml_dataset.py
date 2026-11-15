@@ -32,8 +32,7 @@ import duckdb
 import pyarrow.dataset as pads
 from deltalake import CommitProperties, DeltaTable, write_deltalake
 
-from .map_grid import load_h3
-from .silver import _literal
+from .silver import _literal, load_h3
 
 METHOD_VERSION = "1.0.0"
 PARTITIONS = ["year", "month"]
@@ -50,6 +49,15 @@ LIMITATIONS = [
 ]
 FEATURES = ["det_24h", "det_3d", "det_7d", "frp_mean_7d", "modis_brightness_mean_7d",
             "viirs_brightness_mean_7d", "ring1_det_24h", "ring1_det_7d", "ring2_det_7d"]
+# Feature select list over the `own`/`ring` CTEs of `_feature_ctes`; shared by training rows and inference.
+FEATURE_COLUMNS_SQL = """
+               coalesce(own.det_24h, 0)::INTEGER AS det_24h, coalesce(own.det_3d, 0)::INTEGER AS det_3d,
+               coalesce(own.det_7d, 0)::INTEGER AS det_7d, own.frp_mean_7d,
+               own.modis_brightness_mean_7d, own.viirs_brightness_mean_7d,
+               coalesce(ring.ring1_det_24h, 0)::INTEGER AS ring1_det_24h,
+               coalesce(ring.ring1_det_7d, 0)::INTEGER AS ring1_det_7d,
+               coalesce(ring.ring2_det_7d, 0)::INTEGER AS ring2_det_7d,
+               (own.c6 IS NOT NULL OR ring.c6 IS NOT NULL) AS active"""
 
 
 def _months_touching(first: date, last: date) -> str:
@@ -76,12 +84,10 @@ def _universe_sql(cutoff_hour: int) -> str:
     """
 
 
-def _classified_sql(first: date, last: date, cutoff_hour: int) -> str:
-    """One row per universe cell and D in [first, last] with inputs, target and coverage."""
-    window_lo, window_hi = first - timedelta(days=INPUT_DAYS), last + timedelta(days=TARGET_DAYS - 1)
+def _det_sql(window_lo: date, window_hi: date, cutoff_hour: int) -> str:
+    """Temp table `det`: per res6 cell and 24 h window in [window_lo, window_hi], counts and sensor sums."""
     start = f"TIMESTAMPTZ '{window_lo.isoformat()} {cutoff_hour:02d}:00:00+00'"
     end = f"TIMESTAMPTZ '{(window_hi + timedelta(days=1)).isoformat()} {cutoff_hour:02d}:00:00+00'"
-    d0, d1 = f"DATE '{first.isoformat()}'", f"DATE '{last.isoformat()}'"
     return f"""
         CREATE OR REPLACE TEMP TABLE det AS
         SELECT h3_r6 AS c6, (acquired_at - INTERVAL {cutoff_hour} HOUR)::DATE AS w, count(*) AS n,
@@ -94,9 +100,14 @@ def _classified_sql(first: date, last: date, cutoff_hour: int) -> str:
         WHERE {_months_touching(window_lo, window_hi + timedelta(days=1))}
           AND acquired_at >= {start} AND acquired_at < {end}
         GROUP BY ALL;
+    """
 
-        CREATE OR REPLACE TEMP TABLE classified AS
-        WITH grid AS (  -- per-cell day series: avoids a non-spilling inequality join
+
+def _feature_ctes(first: date, last: date) -> str:
+    """CTEs `grid` (universe cell x D), `own` and `ring`: inputs from windows D-7..D-1 of `det` only."""
+    d0, d1 = f"DATE '{first.isoformat()}'", f"DATE '{last.isoformat()}'"
+    return f"""
+        grid AS (  -- per-cell day series: avoids a non-spilling inequality join
             SELECT c6, c4, c1, unnest(generate_series(greatest(first_window + 1, {d0}), {d1}, INTERVAL 1 DAY))::DATE AS d
             FROM universe WHERE first_window + 1 <= {d1}),
         own AS (
@@ -117,7 +128,15 @@ def _classified_sql(first: date, last: date, cutoff_hour: int) -> str:
                          (w + k::INTEGER) AS d, n
                   FROM det, range(1, 3) rr(r), range(1, {INPUT_DAYS + 1}) t(k)
                   WHERE w + k::INTEGER BETWEEN {d0} AND {d1})
-            GROUP BY 1, 2),
+            GROUP BY 1, 2)"""
+
+
+def _target_ctes(first: date, last: date) -> str:
+    """CTEs `positive` (any detection in windows D..D+6) and `covered` (res4 pass in all 7 windows) for D in
+    [first, last]; need `det` over windows first..last+6 and the `coverage` relation."""
+    window_hi = last + timedelta(days=TARGET_DAYS - 1)
+    d0, d1 = f"DATE '{first.isoformat()}'", f"DATE '{last.isoformat()}'"
+    return f"""
         positive AS (
             SELECT DISTINCT c6, (w - k::INTEGER) AS d FROM det, range(0, {TARGET_DAYS}) t(k)
             WHERE w - k::INTEGER BETWEEN {d0} AND {d1}),
@@ -127,21 +146,37 @@ def _classified_sql(first: date, last: date, cutoff_hour: int) -> str:
             WHERE year BETWEEN {first.year} AND {window_hi.year}
               AND window_date BETWEEN {d0} AND {d1} + {TARGET_DAYS - 1}
               AND window_date - k::INTEGER BETWEEN {d0} AND {d1}
-            GROUP BY 1, 2 HAVING count(*) = {TARGET_DAYS})
-        SELECT g.c6, g.c1, g.d,
-               coalesce(own.det_24h, 0)::INTEGER AS det_24h, coalesce(own.det_3d, 0)::INTEGER AS det_3d,
-               coalesce(own.det_7d, 0)::INTEGER AS det_7d, own.frp_mean_7d,
-               own.modis_brightness_mean_7d, own.viirs_brightness_mean_7d,
-               coalesce(ring.ring1_det_24h, 0)::INTEGER AS ring1_det_24h,
-               coalesce(ring.ring1_det_7d, 0)::INTEGER AS ring1_det_7d,
-               coalesce(ring.ring2_det_7d, 0)::INTEGER AS ring2_det_7d,
-               (own.c6 IS NOT NULL OR ring.c6 IS NOT NULL) AS active,
+            GROUP BY 1, 2 HAVING count(*) = {TARGET_DAYS})"""
+
+
+def _classified_sql(first: date, last: date, cutoff_hour: int) -> str:
+    """One row per universe cell and D in [first, last] with inputs, target and coverage."""
+    window_lo, window_hi = first - timedelta(days=INPUT_DAYS), last + timedelta(days=TARGET_DAYS - 1)
+    return _det_sql(window_lo, window_hi, cutoff_hour) + f"""
+        CREATE OR REPLACE TEMP TABLE classified AS
+        WITH {_feature_ctes(first, last)}, {_target_ctes(first, last)}
+        SELECT g.c6, g.c1, g.d, {FEATURE_COLUMNS_SQL},
                CASE WHEN positive.c6 IS NOT NULL THEN 1 WHEN covered.c4 IS NOT NULL THEN 0 END::TINYINT AS target
         FROM grid g
         LEFT JOIN own ON own.c6 = g.c6 AND own.d = g.d
         LEFT JOIN ring ON ring.c6 = g.c6 AND ring.d = g.d
         LEFT JOIN positive ON positive.c6 = g.c6 AND positive.d = g.d
         LEFT JOIN covered ON covered.c4 = g.c4 AND covered.d = g.d;
+    """
+
+
+def features_sql(issue_date: date, cutoff_hour: int) -> str:
+    """Temp table `features`: one row per universe cell for forecast day `issue_date`, inputs only.
+
+    Same windows and expressions as the training rows; no target or coverage, so it needs data only up to
+    the `issue_date` cutoff. Requires the temp table `universe` (see `_universe_sql`)."""
+    return _det_sql(issue_date - timedelta(days=INPUT_DAYS), issue_date - timedelta(days=1), cutoff_hour) + f"""
+        CREATE OR REPLACE TEMP TABLE features AS
+        WITH {_feature_ctes(issue_date, issue_date)}
+        SELECT g.c6, g.c1, g.d, {FEATURE_COLUMNS_SQL}
+        FROM grid g
+        LEFT JOIN own ON own.c6 = g.c6 AND own.d = g.d
+        LEFT JOIN ring ON ring.c6 = g.c6 AND ring.d = g.d;
     """
 
 
@@ -178,7 +213,7 @@ def _rows_sql(year: int, month: int, eval_start: date, sample_rate: float, seed:
     """
 
 
-def _connect(silver: str, coverage: str, memory_limit: str, threads: int, temp_dir: str | Path | None,
+def _connect(silver: str, coverage: str | None, memory_limit: str, threads: int, temp_dir: str | Path | None,
              storage_options: dict[str, str] | None) -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect()
     connection.execute(f"SET memory_limit={_literal(memory_limit)}")
@@ -190,7 +225,8 @@ def _connect(silver: str, coverage: str, memory_limit: str, threads: int, temp_d
         connection.execute(f"SET temp_directory={_literal(str(temp_dir))}")
     load_h3(connection)
     connection.register("silver", DeltaTable(silver, storage_options=storage_options).to_pyarrow_dataset())
-    connection.register("coverage", DeltaTable(coverage, storage_options=storage_options).to_pyarrow_dataset())
+    if coverage is not None:
+        connection.register("coverage", DeltaTable(coverage, storage_options=storage_options).to_pyarrow_dataset())
     return connection
 
 
