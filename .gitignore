@@ -13,3 +13,5 @@ __pycache__/
 /demo/
 /j1.csv
 /.omp/evidence/RF07-harmonization/model-v0.3/
+
+/.omp/
