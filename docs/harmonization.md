@@ -19,6 +19,8 @@ PYTHONPATH=src python -m fire_atlas_data harmonize-eras --silver $S --model-dir 
 - `harmonize-fit` recusa gravar sobre um modelo existente.
 - `harmonize-eval` recusa gravar sobre um relatório existente: o teste final roda uma vez.
 - `harmonize` regrava um commit Delta por ano (`--year` repetível para atualizar só alguns) e confere cada ano com a silver.
+- `harmonize --vacuum` apaga, depois do `verify`, os arquivos das duas tabelas que a última versão não usa mais. Versões anteriores deixam de ser legíveis. O job diário não faz vacuum: os arquivos substituídos acumulam no bucket até um `--vacuum` manual.
+- Depois de gravar cada ano, `harmonize` aplica Z-order em `day` às partições do ano (um commit `OPTIMIZE`), com row groups de 131.072 linhas (`CELLS_ROW_GROUP`). Em r6/2026, os row groups cobrem mediana de 5 dias e máximo de 7; arquivos consecutivos podem compartilhar o dia da borda. Uma leitura filtrada por dia descarta os outros intervalos pelas estatísticas. Ordenar antes de gravar não basta: o writer paralelo do delta-rs intercala os lotes. No smoke sintético, Z-order em `(day, h3_cell)` espalhou os row groups por mais dias que `day` sozinho; a implementação prioriza consultas por dia, sem clustering espacial. Leitores devem usar o log Delta (tabela Delta-aware ou manifest), não listar o prefixo: os arquivos substituídos ficam no bucket até o vacuum.
 - `harmonize-eras` mede, com o modelo fixo, o erro contra o Aqua da série composta em cada época de plataformas, nos anos de teste. Também mede o Terra sozinho em 2003–2004, anos usados no ajuste (por isso o resultado é otimista), e a concordância VIIRS/Aqua em 2020–2025, que é concordância com um Aqua em deriva, não erro. É uma segunda leitura dos anos de teste, portanto não é independente. Recusa gravar sobre um relatório existente.
 
 ## O que a série representa
@@ -58,6 +60,7 @@ Cada unidade de uma plataforma vira "unidades equivalentes do Aqua": quantas uni
 | `detections_<p>` | Detecções originais da plataforma, sem ajuste. |
 | `aqua_eq_<p>` | Estimativa da plataforma em unidades equivalentes do Aqua; NULL sem unidade. |
 | `harmonized` | Valor do calendário: valor da série na célula e no dia, somado nas células r6 filhas nos níveis 0 a 5. |
+| `harmonized_t_lt320`, `harmonized_t320`, `harmonized_t330`, `harmonized_t340`, `harmonized_t350`, `harmonized_t_ge360`, `harmonized_t_none` | `harmonized` repartido pela temperatura de brilho (K) do pixel mais quente de cada unidade que contribui: < 320, [320, 330), [330, 340), [340, 350), [350, 360), ≥ 360 e sem medida de brilho. Mesma regra de `harmonized` (só unidades que contribuem, divididas por `contributing`), somadas nos níveis 0 a 5; as sete faixas somam `harmonized`. Gravadas em 2000–2026 em 15/11/2026 (`cells` v56). |
 | `contributing` | Quantas plataformas entraram na série naquele dia; 0 = sem dado. |
 | `basis` | Base da série no dia: `aqua`, `viirs` ou `terra`; NULL = sem dado. |
 | `low_confidence` | `true` quando a base é o Terra: período 2000-11 a 2002-06 e dias de pane do Aqua sem VIIRS. O app mostra o aviso «Menos confiável: só o satélite Terra; erro cerca de 2× maior». |
@@ -69,6 +72,8 @@ Cada unidade de uma plataforma vira "unidades equivalentes do Aqua": quantas uni
 - EN: "Harmonized fire activity (MODIS Aqua-equivalent active cells)"
 
 Não chamar de "focos" nem de "incêndios". O original de cada satélite fica em `detections_<p>`.
+
+**Temperatura de brilho das faixas:** é a do sensor da base do dia (`viirs` → VIIRS I-4, 375 m; `aqua`/`terra` → MODIS canal 21/22, 1 km). As faixas não são comparáveis entre bases nem convertidas para a escala do Aqua, e não são a temperatura da chama. O I-4 do VIIRS satura perto de 367 K. A lista de faixas fica em `TEMPERATURE_BINS` e nos metadados de cada commit (`temperature_bins`).
 
 `availability`, particionada por `year`: por plataforma e dia, `units` no mundo, `typical_units` (mediana de ±30 dias), `available`, `contributes` (entrou na série) e `basis`. Um dia sem nenhuma plataforma contribuindo não tem dado; não é dia sem fogo.
 
@@ -189,4 +194,5 @@ Relatórios: `detect-noaqua.json`, `detect-A.json`, `detect-B.json` e `eras-v03.
 - A pane é detectada por plataforma e dia no mundo inteiro. Falha regional ou de parte do dia ainda reduz o valor daquele dia.
 - Todos os tipos de foco entram (o NRT não traz o tipo), então fontes de calor estáticas contam como atividade.
 - Os meses recentes são dados NRT e podem mudar quando o produto padrão os substituir. O dia corrente fica sem dado até completar.
+- As faixas de temperatura usam o brilho bruto do sensor da base, sem harmonização entre sensores: uma mudança de base (por exemplo, `aqua` → `viirs` em 2020) muda a distribuição das faixas.
 - O `daily-ingest` regrava o ano corrente (e o anterior em janeiro). Uma mudança na silver mais antiga que isso, como reprocessamento do produto padrão, exige `harmonize --year <ano>`.

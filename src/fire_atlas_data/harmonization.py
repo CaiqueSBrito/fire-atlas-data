@@ -30,7 +30,7 @@ import tempfile
 import time
 
 import duckdb
-from deltalake import CommitProperties, DeltaTable, write_deltalake
+from deltalake import CommitProperties, DeltaTable, WriterProperties, write_deltalake
 import numpy as np
 import pyarrow as pa
 import xgboost as xgb
@@ -43,6 +43,12 @@ METHOD_VERSION = "0.1.0"
 PARTITIONS = ["resolution", "year"]
 LEVELS = tuple(range(7))      # H3 resolutions written; the method works on res6 units
 AVAILABILITY_PARTITIONS = ["year"]
+# After each year is written, its cells are Z-ordered on `day` alone, in row groups of a few days of res6, so a
+# reader filtering one day skips the rest of the year by file and row-group statistics. Sorting before the write
+# does not survive delta-rs (its parallel writer interleaves the batches). In the synthetic smoke on 2026-11-15,
+# Z-order on (day, h3_cell) had a median row-group span of 65 days, against 5 for `day` alone.
+ZORDER = ["day"]
+CELLS_ROW_GROUP = 131_072
 REFERENCE = "Aqua"
 REFERENCE_END = date(2019, 12, 31)   # last local day on which MODIS (Aqua, then Terra) can feed `harmonized`
 TEST_YEARS = (2018, 2019)
@@ -54,6 +60,11 @@ LINKS = {
     "NOAA-21": {"curve": "Suomi-NPP", "target": "NOAA-20", "fit": (2023, 2024)},
 }
 SLUGS = {"Terra": "terra", "Aqua": "aqua", "Suomi-NPP": "snpp", "NOAA-20": "noaa20", "NOAA-21": "noaa21"}
+# (column, condition on `bright` in K): brightness temperature bins that split `harmonized`
+TEMPERATURE_BINS = (("t_lt320", "bright < 320"), ("t320", "bright >= 320 AND bright < 330"),
+                    ("t330", "bright >= 330 AND bright < 340"), ("t340", "bright >= 340 AND bright < 350"),
+                    ("t350", "bright >= 350 AND bright < 360"), ("t_ge360", "bright >= 360"),
+                    ("t_none", "bright IS NULL"))
 VIIRS = ("Suomi-NPP", "NOAA-20", "NOAA-21")
 SERIES_RULE = "aqua-first-0.2"       # composition of `harmonized`; independent of the fitted model version
 # (platform, compared against, year outside both fit windows): estimates of the same burning should agree
@@ -90,6 +101,9 @@ LIMITATIONS = [
     "Terra passes in the morning: its estimate carries the regional diurnal cycle of the fit years.",
     "All hotspot types are kept (NRT has no type), so static heat sources count as activity.",
     "Recent months are NRT data and may change when the standard product replaces them.",
+    "Temperature bins use the brightness temperature (K) of the unit's hottest pixel: VIIRS I-4 when basis is viirs, "
+    "MODIS channel 21/22 when basis is aqua or terra; not comparable across bases and not the flame temperature. "
+    "VIIRS I-4 saturates near 367 K.",
     "Not an accepted harmonization: thresholds for CA07 were not approved.",
 ]
 
@@ -357,7 +371,8 @@ def _estimates_sql(year: int) -> str:
                CASE WHEN aqua THEN 1 WHEN viirs > 0 THEN viirs WHEN terra THEN 1 ELSE 0 END AS n
         FROM f;
         CREATE OR REPLACE TEMP TABLE est AS
-        SELECT e.platform, e.c6, e.day, e.dn, e.n, e.est, coalesce(a.ok, FALSE) AND {_contributes('d', 'e')} AS contributes
+        SELECT e.platform, e.c6, e.day, e.dn, e.n, e.est, e.bright,
+               coalesce(a.ok, FALSE) AND {_contributes('d', 'e')} AS contributes
         FROM ({_with_est(f"({_with_p('units')})")}) e
         LEFT JOIN avail a ON a.platform = e.platform AND a.day = e.day
         LEFT JOIN days d ON d.day = e.day
@@ -373,11 +388,17 @@ def _cell_columns(alias: str) -> str:
 
 
 def _r6_sql(year: int) -> str:
-    """Temp table `r6`: one row per (res6 cell, local day) with any unit: per-platform columns and `harmonized`."""
+    """Temp table `r6`: one row per (res6 cell, local day) with any unit: per-platform columns, `harmonized` and
+    its split by the brightness temperature of the contributing units (TEMPERATURE_BINS)."""
+    bins = ", ".join(
+        f"coalesce(sum(e.est) FILTER (WHERE e.contributes AND ({cond.replace('bright', 'e.bright')})), 0)"
+        f" / nullif(any_value(d.n), 0) AS harmonized_{name}"
+        for name, cond in TEMPERATURE_BINS)
     return f"""
         CREATE OR REPLACE TEMP TABLE r6 AS
         SELECT {DATE_SQL.format('e.day')} AS day, e.c6 AS h3_cell, {_cell_columns('e')},
                coalesce(sum(e.est) FILTER (WHERE e.contributes), 0) / nullif(any_value(d.n), 0) AS harmonized,
+               {bins},
                any_value(d.n)::TINYINT AS contributing, any_value(d.basis) AS basis
         FROM est e JOIN days d ON d.day = e.day
         GROUP BY e.day, e.c6"""
@@ -386,16 +407,18 @@ def _r6_sql(year: int) -> str:
 def _cells_sql(year: int) -> str:
     """Rows of every resolution: the res6 rows of `r6` and their sums per parent cell and day."""
     values = [f"{kind}_{slug}" for slug in SLUGS.values() for kind in ("units", "detections", "aqua_eq")]
-    columns = f"h3_cell, day, {', '.join(values)}, harmonized, contributing, basis"
+    temps = [f"harmonized_{name}" for name, _ in TEMPERATURE_BINS]
+    columns = f"h3_cell, day, {', '.join(values)}, harmonized, {', '.join(temps)}, contributing, basis"
     parts = [f"SELECT 6 AS resolution, {columns} FROM r6"]
     sums = ", ".join(f"sum({v})::{'DOUBLE' if v.startswith('aqua_eq') else 'INTEGER'} AS {v}" for v in values)
+    temp_sums = ", ".join(f"sum({t}) AS {t}" for t in temps)
     parts += [f"""SELECT {res} AS resolution, h3_cell_to_parent(h3_cell::UBIGINT, {res})::BIGINT AS h3_cell, day,
-                         {sums}, sum(harmonized) AS harmonized, any_value(contributing) AS contributing,
+                         {sums}, sum(harmonized) AS harmonized, {temp_sums}, any_value(contributing) AS contributing,
                          any_value(basis) AS basis
                   FROM r6 GROUP BY 2, 3""" for res in LEVELS if res < 6]
     return f"""
-        SELECT resolution::INTEGER AS resolution, h3_cell, day, {', '.join(values)}, harmonized, contributing,
-               basis, basis = 'terra' AS low_confidence, {year}::INTEGER AS year
+        SELECT resolution::INTEGER AS resolution, h3_cell, day, {', '.join(values)}, harmonized, {', '.join(temps)},
+               contributing, basis, basis = 'terra' AS low_confidence, {year}::INTEGER AS year
         FROM ({' UNION ALL '.join(parts)})"""
 
 
@@ -760,7 +783,8 @@ def apply(silver: str, model_dir: str | Path, target: str, availability: str, *,
             years = list(range(first, last + 1))
         metadata = {"method_version": METHOD_VERSION, "silver": silver, "silver_version": str(silver_version),
                     "curve_sha256": model["sha256"]["curve"], "factor_sha256": model["sha256"]["factor"],
-                    "unit_label_pt": UNIT_LABEL["pt"], "unit_label_en": UNIT_LABEL["en"], "series_rule": SERIES_RULE}
+                    "unit_label_pt": UNIT_LABEL["pt"], "unit_label_en": UNIT_LABEL["en"], "series_rule": SERIES_RULE,
+                    "temperature_bins": json.dumps(TEMPERATURE_BINS)}
         for year in sorted(set(years)):
             tic = time.monotonic()
             _load_window(connection, date(year, 1, 1) - timedelta(days=OUTAGE_WINDOW_DAYS),
@@ -781,8 +805,12 @@ def apply(silver: str, model_dir: str | Path, target: str, availability: str, *,
                 exists = DeltaTable.is_deltatable(path, storage_options=storage_options)
                 write_deltalake(path, connection.sql(sql).to_arrow_reader(1_000_000), mode="overwrite",
                                 partition_by=partitions, predicate=f"year = {year}" if exists else None,
-                                storage_options=storage_options,
+                                schema_mode="merge" if exists else None, storage_options=storage_options,
                                 commit_properties=CommitProperties(custom_metadata={**metadata, "year": str(year)}))
+            DeltaTable(target, storage_options=storage_options).optimize.z_order(
+                ZORDER, partition_filters=[("year", "=", str(year))], max_concurrent_tasks=1,
+                max_spill_size=3 * 1024 ** 3, writer_properties=WriterProperties(max_row_group_size=CELLS_ROW_GROUP),
+                commit_properties=CommitProperties(custom_metadata={**metadata, "year": str(year)}))
             counts[str(year)] = {"harmonized": harmonized, "days_without_contributing_platform": without_data,
                                  "platforms": platforms}
             print(f"harmonize {year}: harmonized {harmonized} ({time.monotonic() - tic:.0f}s)",
@@ -794,7 +822,8 @@ def apply(silver: str, model_dir: str | Path, target: str, availability: str, *,
 def verify(target: str, silver: str, *, years: list[int], storage_options: dict[str, str] | None = None,
            memory_limit: str = "16GB", threads: int = 8, temp_dir: str | Path | None = None) -> dict:
     """Per local-day year and resolution: detections per platform equal silver, one row per cell and day,
-    and the same `harmonized` total at every resolution."""
+    the same `harmonized` total at every resolution and temperature bins that add up to `harmonized`."""
+    temps = " + ".join(f"coalesce(harmonized_{name}, 0)" for name, _ in TEMPERATURE_BINS)
     sums = ", ".join(f"sum(detections_{slug})" for slug in SLUGS.values())
     report = {}
     with ml_dataset._connect(silver, None, memory_limit, threads, temp_dir, storage_options) as connection:
@@ -819,6 +848,10 @@ def verify(target: str, silver: str, *, years: list[int], storage_options: dict[
                                        f"distinct={distinct} silver={expected} table={found}")
             if [r for r, *_ in levels] != list(LEVELS) or max(totals) - min(totals) > 1e-6 * max(1.0, max(totals)):
                 raise RuntimeError(f"harmonized {year}: resolutions {[r for r, *_ in levels]}, totals {totals}")
+            bad = connection.execute(f"SELECT count(*) FROM cells WHERE year = {year} "
+                                     f"AND abs(({temps}) - harmonized) > 1e-9 * greatest(1, harmonized)").fetchone()[0]
+            if bad:
+                raise RuntimeError(f"harmonized {year}: {bad} rows whose temperature bins do not add up to harmonized")
             report[str(year)] = {f"r{r}": rows for r, rows, *_ in levels} | {"harmonized": totals[0]}
     return report
 

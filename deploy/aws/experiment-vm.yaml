@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  fire-atlas-data experiment VM (RF10/CA08 retrospective experiments). One on-demand EC2 instance with an
-  instance profile that reads the lake (silver, coverage, models, reference) and writes only under
-  s3://<bucket>/experiments/ and gold/harmonized/. SSH only from one /32. Delete the stack to stop billing; the root volume is
+  fire-atlas-data experiment and lake-maintenance VM. One on-demand EC2 instance with an
+  instance profile that reads the lake and writes only under experiments/, gold/harmonized/ and
+  gold/map_grid/. SSH only from one /32. Delete the stack to stop billing; the root volume is
   deleted with the instance, results must be copied to S3 first.
 
 Metadata:
@@ -95,12 +95,15 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/reference/*"
                   - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/experiments/*"
                   - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/harmonized/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/map_grid/*"
               - Effect: Allow
                 Action: [s3:PutObject, s3:DeleteObject]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/experiments/*"
                   # full rebuilds of the harmonized tables (too large for the Fargate daily job)
                   - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/harmonized/*"
+                  # atomic repartition of the existing map; never vacuum during migration
+                  - !Sub "arn:${AWS::Partition}:s3:::${LakeBucket}/gold/map_grid/*"
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile

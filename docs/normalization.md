@@ -75,7 +75,17 @@ PYTHONPATH=src python -m fire_atlas_data gold-map --silver $LAKE/prata/silver \
   --memory-limit 2GB --threads 2
 ```
 
-Cada linha é (`resolution` 0–6, `h3_cell`, `day` UTC, `sensor`) com `detections`, `platforms`, FRP (soma, média e máximo), `brightness_max_k`, contagem VIIRS por confiança `l`/`n`/`h` e média de confiança MODIS. Partição `resolution`/`year`, um commit Delta por partição e Z-order em (`day`, `h3_cell`) com `--optimize`. Ao final, o `verify` confere que a soma de detecções em cada resolução é igual ao número de linhas da silver no ano. Não há filtro de confiança. Sensores ficam separados, sem harmonização nem deduplicação. Célula ausente é desconhecida, não ausência confirmada de fogo. No lake: `s3://data-lake-fire-atlas-553607359608-us-east-2-an/gold/map_grid`. Continente, país e cidade: [gold-places](gold-places.md).
+Cada linha é (`resolution` 0–6, `h3_cell`, `day` UTC, `sensor`) com `detections`, `platforms`, FRP (soma, média e máximo), `brightness_max_k`, contagem VIIRS por confiança `l`/`n`/`h` e média de confiança MODIS. Partição `resolution`/`year`/`month`, com mês derivado de `day` UTC. O build substitui cada (`resolution`, `year`) em um commit Delta, incluindo todas as suas partições mensais; Z-order em (`day`, `h3_cell`) com `--optimize` é executado por mês. Ao final, o `verify` confere as sete resoluções e a soma de detecções contra a silver em cada mês, além da coerência entre data e partição. Não há filtro de confiança. Sensores ficam separados, sem harmonização nem deduplicação. Célula ausente é desconhecida, não ausência confirmada de fogo. No lake: `s3://data-lake-fire-atlas-553607359608-us-east-2-an/gold/map_grid`. Continente, país e cidade: [gold-places](gold-places.md).
+
+Para migrar uma tabela existente particionada apenas por `resolution/year`:
+
+```sh
+PYTHONPATH=src python -m fire_atlas_data gold-map-repartition \
+  --target $LAKE/gold/map_grid --memory-limit 32GB --threads 16 \
+  --temp-dir /workspace/spill
+```
+
+A migração reescreve os agregados existentes, acrescentando somente `month`, e publica o novo layout em **um commit Delta atômico no mesmo caminho**. Não recalcula a silver nem atualiza a data dos dados. Valida contagem de linhas, soma de detecções e soma de hashes de todas as colunas originais por resolução/ano/mês antes/depois; hashes não constituem prova sem colisões. Não executar escritores concorrentes nem vacuum durante a migração: os arquivos antigos permanecem disponíveis para leitura da versão anterior. Leitores devem renovar seu snapshot Delta para enxergar o novo layout; leitura direta de todos os Parquets mistura arquivos antigos e novos e não é suportada. Uma tabela já mensal não é reescrita. Dimensionar RAM também para os buffers do escritor Delta, não apenas para o limite DuckDB.
 
 ## Fontes primárias
 

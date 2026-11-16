@@ -87,7 +87,7 @@ PYTHONPATH=src python -m fire_atlas_data silver output/firms-backfill/*/*/*/ --t
 PYTHONPATH=src python -m fire_atlas_data gold-map --silver $LAKE/prata/silver --target $LAKE/gold/map_grid --optimize
 ```
 
-A silver guarda todas as observações aceitas com uma célula H3 por resolução de 0 a 6, particionadas por ano e mês de aquisição. Os níveis são aninhados exatamente. `gold-map` agrega por (resolução, célula, dia UTC, sensor) e não soma sensores. Detalhes do mapa: [normalização § agregação para mapa](docs/normalization.md#agregação-para-mapa). Para localização das células: [gold-places](docs/gold-places.md).
+A silver guarda todas as observações aceitas com uma célula H3 por resolução de 0 a 6, particionadas por ano e mês de aquisição. Os níveis são aninhados exatamente. `gold-map` agrega por (resolução, célula, dia UTC, sensor), particiona por `resolution/year/month` e não soma sensores. Tabelas antigas migram sem recalcular os agregados com `gold-map-repartition --target $LAKE/gold/map_grid`. Detalhes do mapa: [normalização § agregação para mapa](docs/normalization.md#agregação-para-mapa). Para localização das células: [gold-places](docs/gold-places.md).
 
 ## Harmonização para o calendário (RF07)
 

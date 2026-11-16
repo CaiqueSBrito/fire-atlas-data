@@ -129,6 +129,10 @@ def test_every_platform_lands_on_the_aqua_scale_and_outages_do_not_lower_the_ser
                         memory_limit="1GB", threads=1)
     harmonization.verify(target, silver, years=[2001, 2016, 2018, 2020, 2023], memory_limit="1GB", threads=1)
     cells = DeltaTable(target).to_pyarrow_table().to_pylist()
+    for day in (date(2018, 8, 12), date(2020, 8, 11)):
+        assert _sum(cells, "harmonized_t340", day, X) == pytest.approx(_sum(cells, "harmonized", day, X))
+        assert _sum(cells, "harmonized_t330", day, X) == 0
+        assert _sum(cells, "harmonized_t_none", day, X) == 0
 
     # Regional factors: the same 700 Suomi-NPP units are worth 175 Aqua units in X and 350 in Y.
     day = date(2016, 8, 12)
@@ -179,6 +183,27 @@ def test_model_loads_from_object_storage_uri(fitted, tmp_path):
     cells = DeltaTable(target).to_pyarrow_table().to_pylist()
     assert _sum(cells, "harmonized", date(2016, 8, 12), X) == pytest.approx(175)
 
+
+def test_temperature_bins_split_harmonized_by_the_brightness_of_each_unit(fitted, tmp_path):
+    _, model = fitted
+    brightness = [315.0, 320.0, 345.0, 360.0, 365.0, None]   # MODIS channel 21/22; the edges open the upper bin
+    rows = _rows("Aqua", X[:len(brightness)], [date(2018, 8, 12)])
+    table = _silver(rows)
+    table = table.set_column(table.schema.get_field_index("brightness_i4_k"), "brightness_i4_k",
+                             pa.array([None] * len(rows), pa.float64()))
+    table = table.set_column(table.schema.get_field_index("brightness_k"), "brightness_k",
+                             pa.array(brightness, pa.float64()))
+    silver, target, availability = str(tmp_path / "silver"), str(tmp_path / "cells"), str(tmp_path / "availability")
+    write_deltalake(silver, table)
+    harmonization.apply(silver, model, target, availability, years=[2018], memory_limit="1GB", threads=1)
+    harmonization.verify(target, silver, years=[2018], memory_limit="1GB", threads=1)
+    cells = DeltaTable(target).to_pyarrow_table().to_pylist()
+    day = date(2018, 8, 12)
+    split = {name: _sum(cells, f"harmonized_{name}", day, X) for name, _ in harmonization.TEMPERATURE_BINS}
+    assert split == {"t_lt320": 1, "t320": 1, "t330": 0, "t340": 1, "t350": 0, "t_ge360": 2, "t_none": 1}
+    # Parents add the bins of their children like they add `harmonized`.
+    parent = h3.str_to_int(h3.cell_to_parent(X[0], 0))
+    assert [r["harmonized_t_ge360"] for r in cells if r["resolution"] == 0 and r["h3_cell"] == parent] == [2]
 
 
 def test_final_test_scores_reserved_years_the_fit_never_saw_and_runs_once(fitted, tmp_path):

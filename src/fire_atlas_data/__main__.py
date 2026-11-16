@@ -6,7 +6,7 @@ import sys
 
 from .coldstart import build as build_coldstart, evaluate_model as evaluate_coldstart
 from .coverage import PRODUCTS as COVERAGE_PRODUCTS, build_cells, fetch_granules
-from .gold import build_map_cells, optimize_map_cells, verify_map_cells
+from .gold import build_map_cells, optimize_map_cells, repartition_map_cells, verify_map_cells
 from .harmonization import (apply as apply_harmonization, cross_validate as cross_validate_harmonization,
                             evaluate as evaluate_harmonization,
                             evaluate_eras as evaluate_harmonization_eras, fit as fit_harmonization,
@@ -56,6 +56,12 @@ def main() -> int:
     gold_map.add_argument("--memory-limit", default="2GB")
     gold_map.add_argument("--threads", type=int, default=2)
     gold_map.add_argument("--temp-dir", help="Spill directory for DuckDB and Z-order (default /tmp may be RAM)")
+    repartition = commands.add_parser("gold-map-repartition",
+                                     help="Atomically add month partitions to an existing gold map table")
+    repartition.add_argument("--target", required=True, help="Existing Delta table path or s3:// URI")
+    repartition.add_argument("--memory-limit", default="2GB")
+    repartition.add_argument("--threads", type=int, default=2)
+    repartition.add_argument("--temp-dir")
     places = commands.add_parser("gold-places",
                                  help="Continent, country and nearest city per H3 res0..6 cell with detections")
     places.add_argument("--silver", required=True, help="Silver Delta table path or s3:// URI")
@@ -160,6 +166,9 @@ def main() -> int:
     harmonize.add_argument("--availability", required=True, help="Platform availability Delta table")
     harmonize.add_argument("--year", action="append", type=int,
                            help="Local-day year to (re)write; repeatable; default every year in silver")
+    harmonize.add_argument("--vacuum", action="store_true",
+                           help="Delete files unreferenced by the latest version of both tables (older versions "
+                                "become unreadable)")
     harmonize_eval.add_argument("--output", required=True, help="Report JSON path; must not exist")
     harmonize_eras.add_argument("--output", required=True, help="Report JSON path; must not exist")
     harmonize_fit.add_argument("--kappa", type=float,
@@ -246,6 +255,11 @@ def main() -> int:
             if args.vacuum:
                 vacuum_silver(args.target)
             manifest["counts"] = verify_map_cells(args.target, args.silver, memory_limit=args.memory_limit)["rows"]
+        elif args.command == "gold-map-repartition":
+            manifest = repartition_map_cells(args.target, memory_limit=args.memory_limit,
+                                             threads=args.threads, temp_dir=args.temp_dir)
+            print(json.dumps(manifest, allow_nan=False))
+            return 0
         elif args.command == "gold-places":
             manifest = build_places(args.silver, args.countries, args.cities, args.target,
                                     memory_limit=args.memory_limit, threads=args.threads, temp_dir=args.temp_dir)
@@ -291,6 +305,8 @@ def main() -> int:
                                            temp_dir=args.temp_dir)
             verify_harmonization(args.target, args.silver, years=[int(y) for y in manifest["counts"]],
                                  memory_limit=args.memory_limit, threads=args.threads, temp_dir=args.temp_dir)
+            if args.vacuum:
+                manifest["vacuumed_files"] = {path: vacuum_silver(path) for path in (args.target, args.availability)}
         elif args.command == "harmonize-eval":
             manifest = evaluate_harmonization(args.silver, args.model_dir, args.output,
                                               memory_limit=args.memory_limit, threads=args.threads,
